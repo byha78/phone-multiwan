@@ -1,0 +1,13 @@
+[Unit]
+Description=Spread internet connections across USB tethering, LAN and Wi-Fi from one phone
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/multiwan-balance
+ExecStopPost=-/usr/sbin/ip route del default proto 99 metric 50
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

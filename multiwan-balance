@@ -1,0 +1,185 @@
+#!/bin/bash
+# multiwan-balance — spread outgoing IPv4 connections across every link
+# that leads to the same phone:
+#   USB   — the phone in USB tethering mode (USB 2.0 + RNDIS tops out at ~300 Mbit/s);
+#   LAN   — a wired link, e.g. a router that takes internet from the phone's hotspot;
+#   Wi-Fi — a Wi-Fi adapter connected straight to the phone's hotspot.
+#
+# Each connection stays on one link (ECMP with an L4 hash); multi-connection
+# downloads use all of them. A link that loses internet is dropped and comes back
+# when it recovers. The route is installed with metric 50 on top of the
+# NetworkManager routes and removed when the service stops.
+#
+# Every setting can be overridden without editing this file:
+#   sudo systemctl edit multiwan-balance
+#   [Service]
+#   Environment=WIFI_MODE=reserve
+#   Environment=USB_WEIGHT=3
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# --- Links ------------------------------------------------------------------
+USB_IF="${USB_IF:-}"            # empty = detect by driver (USB_DRIVERS)
+LAN_IF="${LAN_IF:-}"            # empty = first wired interface with a gateway that is not USB
+WIFI_IF="${WIFI_IF:-}"          # empty = first wireless interface
+USB_DRIVERS="${USB_DRIVERS:-rndis_host cdc_ncm cdc_ether ipheth}"   # Android, Android NCM, generic, iPhone
+WIFI_MODE="${WIFI_MODE:-balance}"   # balance = third link; reserve = used only if USB and LAN are down
+
+# --- Weights: share of new connections per link -------------------------------
+USB_WEIGHT="${USB_WEIGHT:-2}"
+LAN_WEIGHT="${LAN_WEIGHT:-1}"
+WIFI_WEIGHT="${WIFI_WEIGHT:-1}"
+
+# --- Health checks -------------------------------------------------------------
+TARGETS="${TARGETS:-1.1.1.1 8.8.8.8}"   # pinged through each link
+PING_TIMEOUT="${PING_TIMEOUT:-4}"       # under load, latency through a phone can reach seconds
+INTERVAL="${INTERVAL:-5}"               # seconds between checks
+FAILS_TO_DOWN="${FAILS_TO_DOWN:-3}"     # consecutive failed checks before a link is dropped
+BUSY_BYTES="${BUSY_BYTES:-1000000}"     # a USB/Wi-Fi link that received more than this per interval is alive
+
+# --- Wi-Fi re-association after the phone comes back ---------------------------
+# An adapter that re-associates at the edge of range stays at a low rate and does
+# not renegotiate when the phone is close again. Reconnect it once in that case.
+REFRESH_SIGNAL="${REFRESH_SIGNAL:--60}" # dBm, signal is good enough again
+REFRESH_CHECKS="${REFRESH_CHECKS:-3}"   # consecutive good checks before reconnecting
+REFRESH_COOLDOWN="${REFRESH_COOLDOWN:-30}"  # seconds to ignore our own disconnect
+
+# --- Fixed (also used by ExecStopPost in the unit file) ------------------------
+METRIC=50
+PROTO=99
+
+declare -A fails lastrx
+
+driver_of() { basename "$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null)" 2>/dev/null; }
+
+is_usb_driver() {
+  local x
+  for x in $USB_DRIVERS; do [ "$1" = "$x" ] && return 0; done
+  return 1
+}
+
+usb_if() {
+  local d
+  for d in /sys/class/net/*; do
+    is_usb_driver "$(driver_of "${d##*/}")" && { echo "${d##*/}"; return; }
+  done
+}
+
+gateway_of() { nmcli -g IP4.GATEWAY device show "$1" 2>/dev/null | head -1; }
+
+lan_if() {     # first wired NetworkManager device with a gateway that is not the USB tether
+  local dev type
+  while IFS=: read -r dev type; do
+    [ "$type" = ethernet ] || continue
+    [ -d "/sys/class/net/$dev/wireless" ] && continue
+    is_usb_driver "$(driver_of "$dev")" && continue
+    [ -n "$(gateway_of "$dev")" ] && { echo "$dev"; return; }
+  done < <(nmcli -t -f DEVICE,TYPE device 2>/dev/null)
+}
+
+wifi_if() {
+  local d
+  for d in /sys/class/net/*; do [ -d "$d/wireless" ] && { echo "${d##*/}"; return; }; done
+}
+
+# $1 interface, $2 = busy -> treat as alive while it is receiving a lot
+# (only for links that carry internet traffic alone, not a local network)
+has_internet() {
+  local ifc=$1 t rx prev
+  if [ "$2" = busy ]; then
+    rx=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
+    prev=${lastrx[$ifc]:-$rx}; lastrx[$ifc]=$rx
+    [ $((rx - prev)) -gt "$BUSY_BYTES" ] && return 0
+  fi
+  for t in $TARGETS; do
+    ping -n -q -c1 -W"$PING_TIMEOUT" -I "$ifc" "$t" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+# Checks a link. Sets OK_GW to its gateway if the link is usable, empty otherwise.
+check() {
+  local ifc=$1 mode=$2 gw
+  OK_GW=""
+  [ -n "$ifc" ] && [ -e "/sys/class/net/$ifc" ] || return
+  gw=$(gateway_of "$ifc")
+  [ -n "$gw" ] || return
+  if has_internet "$ifc" "$mode"; then
+    fails[$ifc]=0
+  else
+    fails[$ifc]=$(( ${fails[$ifc]:-0} + 1 ))
+  fi
+  [ "${fails[$ifc]}" -lt "$FAILS_TO_DOWN" ] && OK_GW=$gw
+}
+
+add_link() {    # $1 name, $2 interface, $3 weight, $4 check mode
+  check "$2" "$4"
+  [ -n "$OK_GW" ] || return
+  hops+=(nexthop via "$OK_GW" dev "$2" weight "$3")
+  names+=("$1")
+}
+
+wifi_lost=0; wifi_good=0; wifi_refreshed=0
+wifi_refresh_check() {
+  local w=$1 link sig now
+  [ -n "$w" ] && [ -e "/sys/class/net/$w" ] || return
+  now=$(date +%s)
+  link=$(iw dev "$w" link 2>/dev/null)
+  if ! echo "$link" | grep -q '^Connected'; then
+    [ $((now - wifi_refreshed)) -gt "$REFRESH_COOLDOWN" ] && wifi_lost=1
+    wifi_good=0
+    return
+  fi
+  [ "$wifi_lost" = 1 ] || return
+  sig=$(echo "$link" | awk '/signal:/{print $2; exit}')
+  if [ -n "$sig" ] && [ "$sig" -ge "$REFRESH_SIGNAL" ]; then wifi_good=$((wifi_good + 1)); else wifi_good=0; fi
+  if [ "$wifi_good" -ge "$REFRESH_CHECKS" ]; then
+    echo "Wi-Fi adapter is back near the phone (signal $sig dBm), reconnecting for full speed"
+    nmcli device disconnect "$w" >/dev/null 2>&1; sleep 2; nmcli device connect "$w" >/dev/null 2>&1
+    wifi_refreshed=$(date +%s); wifi_lost=0; wifi_good=0
+  fi
+}
+
+cleanup() { ip route del default proto "$PROTO" metric "$METRIC" 2>/dev/null; exit 0; }
+trap cleanup TERM INT
+
+sysctl -q -w net.ipv4.fib_multipath_hash_policy=1 net.ipv4.fib_multipath_use_neigh=1
+
+last="-"
+while :; do
+  u=${USB_IF:-$(usb_if)}
+  l=${LAN_IF:-$(lan_if)}
+  w=${WIFI_IF:-$(wifi_if)}
+
+  wifi_refresh_check "$w"
+  hops=(); names=()
+  add_link "USB" "$u" "$USB_WEIGHT" busy
+  add_link "LAN" "$l" "$LAN_WEIGHT"
+  if [ "$WIFI_MODE" = balance ]; then
+    add_link "Wi-Fi" "$w" "$WIFI_WEIGHT" busy
+  elif [ ${#names[@]} -eq 0 ]; then
+    add_link "Wi-Fi (reserve)" "$w" 1 busy
+  fi
+
+  if [ ${#names[@]} -ge 2 ]; then
+    want="${hops[*]}"
+  elif [ ${#names[@]} -eq 1 ]; then
+    want="via ${hops[2]} dev ${hops[4]}"
+  else
+    want=""
+  fi
+
+  cur=$(ip -4 route show default proto "$PROTO")
+  if [ -n "$want" ]; then
+    if [ "$want" != "$last" ] || [ -z "$cur" ]; then
+      # shellcheck disable=SC2086  # $want is a list of arguments for ip
+      ip route replace default proto "$PROTO" metric "$METRIC" $want \
+        && { list=$(printf '%s, ' "${names[@]}"); echo "Active: ${list%, }"; }
+    fi
+  elif [ -n "$cur" ] || [ "$want" != "$last" ]; then
+    ip route del default proto "$PROTO" metric "$METRIC" 2>/dev/null
+    echo "No working links, falling back to NetworkManager routes"
+  fi
+  last=$want
+  sleep "$INTERVAL"
+done
