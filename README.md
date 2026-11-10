@@ -10,6 +10,8 @@ A Linux service that spreads connections across several ways of sharing internet
 
 Why: every tethering method has its own ceiling. USB 2.0 + RNDIS gives ~300 Mbit/s, the phone's Wi‑Fi hotspot ~145–160 for all clients together, a router with 10/100 ports ~98. The cellular network can deliver more than any of them. In the author's case the 5G phone got ~450 Mbit/s: through the router alone the computer saw 96–98, through all three links 456 in speedtest.
 
+Full write-up with measurements (in Russian): [article on Habr](https://habr.com/ru/articles/1105562/), copy in this repo: [docs/article.ru.md](docs/article.ru.md).
+
 ## How it works
 
 ```
